@@ -97,11 +97,42 @@
 
 目标、截止和优先级变化不通过普通 PATCH 静默修改，应先创建 UserFeedback/Proposal 或专用确认操作。
 
+`POST /projects/{project_id}/pause` 在同一用户周重分配事务中完成：保留已完成任务和实际投入；取消当前与后续窗口中仍为 planned 的任务；将当前 active WeekPlan 和全部后续 prepared WeekPlan 置为 superseded；将当前 active allocation 与后续 reserved allocation 置为 released；取消项目规划运行并使未应用 Proposal 失效；随后仅以未锁定的剩余容量创建新的 AllocationSet 供其他 active 项目分配。paused 项目不占容量、不生成任务。`POST /projects/{project_id}/resume` 创建新的 AllocationSet 版本，项目只有重新获得大于 0 的预算后才创建 prepared 计划并投递 WeeklyReview。
+
+GoalChange 使用独立的 `/goal-changes/{candidate_id}/confirm`，不复用 `/feedback/{feedback_id}/confirm` 直接应用。请求必须通过 `Idempotency-Key` 请求头提供幂等键；请求体只包含后端生成的候选 ID、确认结果和版本：
+
+```json
+{
+  "candidate_id": "gc_123",
+  "decision": "accept",
+  "expected_project_revision": 6,
+  "expected_preference_revision": 4
+}
+```
+
+示例请求头：`Idempotency-Key: goal-change-confirm-01`。不接受请求体中的 `idempotency_key`；缺失请求头、同一用户重复使用不同请求体或规范化请求摘要不一致时，分别按通用约定返回校验错误或 `IDEMPOTENCY_KEY_REUSED`。
+
+服务端根据 candidate_id 读取已保存的影响预览，重新校验 `expected_project_revision`（项目变更）或 `expected_preference_revision`（长期容量/偏好变更），通过后才执行 `ApplyProjectGoalChange`/`ApplyPreferenceChange`。成功响应示例：
+
+```json
+{
+  "candidate_id": "gc_123",
+  "decision": "accepted",
+  "project_id": "p_123",
+  "project_revision": 7,
+  "route_revision": 9,
+  "plan_revision": 17,
+  "planning_run_id": "run_456"
+}
+```
+
+拒绝只记录 `decision=rejected`，不改变项目。版本冲突返回 `409 PROJECT_REVISION_CONFLICT` 或 `409 PREFERENCE_REVISION_CONFLICT`，并包含 `candidate_id`、`expected_revision`、`current_revision` 和 `requires_refresh=true`；客户端必须重新获取候选，不能强制覆盖。
+
 创建继任项目仍使用 POST `/projects`，可带 predecessor_project_id；后端只允许引用同一用户且 status=closed 的项目。旧任务不会自动复制，新项目必须重新经过 GoalUnderstanding/InitialPlanning。
 
 截止只接受 `YYYY-MM-DD`。GoalUnderstanding 将考试/比赛规范化为 `deadline_day_policy=event_exclusive`，交付规范化为 `date_inclusive`；无法判断时只追问是否可在截止当天执行，不接收具体时刻。
 
-周中确认新项目的初始计划时，应用服务为当前周和下一周分别创建或复用 UserWeekCapacity，并为每个受影响周创建 `run_type=reallocation` 的 UserWeekRun。它只重新分配尚未锁定预算，不重复执行周一基线晋升。
+周中确认新项目的初始计划时，应用服务按上海业务日期计算残周：剩余不少于 4 天时，为当前周和下一周创建或复用 UserWeekCapacity；剩余少于 4 天时，额外创建或复用下下周容量，以支持“残周启动 + 下一执行周 + 后一预备周”。应用服务为每个受影响周创建 `run_type=reallocation` 的 UserWeekRun，只重新分配尚未锁定预算，不重复执行周一基线晋升。
 
 ### 2.3 User Week 与 WeekPlan
 
@@ -136,9 +167,11 @@
 }
 ```
 
-服务端在同一事务中更新 Task 当前状态、递增 version 并追加 TaskEvent。
+服务端在同一事务中更新 Task 当前状态、递增 version 并追加 TaskEvent。`actual_minutes` 表示该任务截至本次事件的累计总投入；完成事件与 duration_recorded 事件都覆盖同一 Task.actual_minutes 投影，不能把两条事件相加。重复请求由 `Idempotency-Key` 请求头去重；已记录的投入在 reopened 或 deferred 后仍归属于原周。
 
 `GET /tasks/current-week` 返回完整周任务池，不设置业务数量上限。按 `necessity desc, order_key` 排序，并为每项派生 `is_blocked` 与未满足 prerequisite 摘要。服务端不能以截断隐藏任务；只通过分页保护接口。不存在用户直接创建 Task 的 POST，新增行动必须先进入 Feedback/Conversation 和规划命令校验。
+
+`GET /user-weeks/current` 和项目周汇总必须返回 `allocation.status=unfunded`、`budget_minutes=0`、`allocation_reason=capacity_shortage`，展示“本周未排入容量”；该状态没有 WeekPlan、任务或 PlanningRun，不返回“计划正在生成”。
 
 ### 2.5 Feedback 与 Conversation
 
@@ -146,13 +179,15 @@
 |---|---|---|
 | POST | `/feedback` | 保存自然语言反馈并返回分类运行 ID |
 | GET | `/feedback/{feedback_id}` | 查询候选分类和处理状态 |
-| POST | `/feedback/{feedback_id}/confirm` | 确认目标级或长期偏好变化 |
+| POST | `/feedback/{feedback_id}/confirm` | 确认反馈分类；目标级变更只生成待确认候选，不直接应用 |
+| GET | `/goal-changes/{candidate_id}` | 获取 GoalChange 候选、影响预览和 expected revisions |
+| POST | `/goal-changes/{candidate_id}/confirm` | 接受或拒绝 GoalChange；接受后应用系统命令 |
 | GET | `/projects/{project_id}/conversations` | 对话列表 |
 | POST | `/projects/{project_id}/messages` | 发送消息并创建必要工作流 |
 
 消息接口返回已保存 Message 和可选 PlanningRun。保存消息成功不等于 AI 回复成功。
 
-重大反馈分类结果必须包含 impact_scope 与 impact_nature。impact_scope=user 时，API 先返回/关联 UserWeekRun reallocation，再由其派生各项目 EventDrivenReplanning；不能直接并行创建多个各自修改容量的项目运行。
+重大反馈分类结果必须包含 impact_scope、impact_nature、urgency 和 execution_blocked。impact_scope=user 时，API 先返回/关联 UserWeekRun reallocation，再由其派生各项目 EventDrivenReplanning；不能直接并行创建多个各自修改容量的项目运行。明确执行事实直接写 TaskEvent；当前任务明确阻塞才进入 temporary，轻微感受先进入 observe。
 
 ### 2.6 PlanningRun 与 Proposal
 
@@ -260,7 +295,8 @@
 |---|---|---|
 | 409 | `ROUTE_REVISION_CONFLICT` | 路线版本变化 |
 | 409 | `PLAN_REVISION_CONFLICT` | 周计划版本变化 |
-| 409 | `PREFERENCE_REVISION_CONFLICT` | 容量或偏好变化 |
+ | 409 | `PREFERENCE_REVISION_CONFLICT` | 容量或偏好变化 |
+| 409 | `PROJECT_REVISION_CONFLICT` | 目标、截止或项目优先级已变化 |
 | 409 | `ALLOCATION_REVISION_CONFLICT` | 项目预算变化 |
 | 409 | `TASK_PRECONDITION_CHANGED` | 任务状态/版本变化 |
 | 409 | `PROPOSAL_EXPIRED` | Proposal 已过期 |
@@ -293,20 +329,27 @@ ensure_user_week_active(user_id, week_start):
     if run.promotion already completed:
       return existing result
 
-    for each active project ordered by project_id:
+    for each current allocation ordered by project_id:
+      project = lock referenced Project
+      if project.status != active or allocation.status == unfunded:
+        continue
       plan = get prepared WeekPlan(project, week_start) for update
       if plan exists:
         promote plan to active
         activate allocation
-      else:
+      else if allocation.budget_minutes > 0 and not deadline_week(project) and not calibration_hold(project):
         create empty active baseline
         record anomaly
 
     mark promotion_completed
     create next-week UserWeekAllocationSet revision and allocation items under next_capacity
-    for each active project eligible in next week:
-      get_or_create empty prepared WeekPlan bound to the new allocation item
-    create OutboxMessage for project planning continuation
+    for each next-week allocation where status=reserved and budget_minutes > 0:
+      project = referenced Project
+      if project.status == active and not deadline_week(project) and not calibration_hold(project):
+        get_or_create empty prepared WeekPlan bound to the new allocation item
+        create OutboxMessage for project WeeklyReview
+      else:
+        mark allocation as released or unfunded according to reason
   commit
 ```
 
@@ -368,8 +411,10 @@ validate_deadline_feasibility(user_id, week_start, proposed_tasks):
   capacity = load UserWeekCapacity and available_weekdays
   normal_days = count(effective available weekdays in full week)
   planning_start = business_date if week_start is current week else week_start
-  consumed = sum(coalesce(explicit actual_minutes, estimated_minutes)
-                 for completed tasks in this week)
+   effective_consumed(task) = task.actual_minutes if not null
+                              else task.estimated_minutes if task.first_completed_at is not null
+                              else 0
+   consumed = sum(effective_consumed(task) for tasks in this week)
   unconsumed_capacity = max(0, allocatable_minutes - consumed)
   canonicalize each task:
     due_date = explicit allowed constraint
@@ -501,7 +546,7 @@ Redis token bucket 按供应商和模型控制：
 ### 7.2 扫描策略
 
 - 每分钟扫描一次需要确保安全基线的用户；
-- 每日扫描 target_date 尚未过去的 planning/active/paused Project，重算截止前剩余 required 工作量与剩余容量；infeasible 时幂等产生 deadline_risk 并立即进入 EventDrivenReplanning，不等待趋势窗口；
+- 每日扫描 target_date 尚未过去的 active Project，重算截止前剩余 required 工作量与剩余容量；infeasible 时幂等产生 deadline_risk 并立即进入 EventDrivenReplanning，不等待趋势窗口；paused 项目只更新风险提示，不创建 PlanningRun，恢复后再规划；
 - 每日扫描所有满足 `target_date < 上海业务日期` 的 planning/active/paused Project，执行幂等 DeadlineClosure：Project 转 closed、terminal_reason=deadline_reached，closed 未完成路线对象，cancelled 所有仍为 planned 的任务并记录 project_deadline_reached，创建 ProjectClosureSnapshot，取消未终结 PlanningRun、失效未应用 Proposal，并停止后续预备周；
 - 周一零点后优先执行不调用模型的基线晋升；
 - AI 周评估随后按批次和供应商限流逐步入队；
@@ -668,8 +713,10 @@ clients/
 9. 接入真实 ModelGateway，通过评测门后再进入 staging；
 10. 小程序初始规划、任务和轮询闭环；
 11. 周一基线、AllocationSet、prepared 壳计划与 WeeklyReview；
-12. Feedback、ProjectWeekAssessment 与 EventDrivenReplanning；
-13. 剩余路线校准、材料、通知和运营监控。
+12. 首次规划在残周不少于/少于 4 天时分别创建两周/三周初始窗口，并校验每周容量与 allocation 绑定；
+13. 周中暂停释放未锁定预算、supersede 当前及后续计划、取消未开始任务，并只允许其他 active 项目参与重分配；
+14. Feedback、ProjectWeekAssessment 与 EventDrivenReplanning；
+15. 剩余路线校准、材料、通知和运营监控。
 
 每一步完成后都应有可运行的垂直切片，避免最后才集成 AI、队列和事务。
 

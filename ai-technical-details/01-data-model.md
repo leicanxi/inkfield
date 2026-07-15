@@ -121,10 +121,10 @@ erDiagram
 | max_task_minutes | integer | check >= preferred | 单任务上限 |
 | available_weekdays | smallint | not null | 7 位 bitmask，周一为最低位 |
 | stable_preferences | jsonb | schema versioned | 其他稳定偏好 |
-| preference_revision | bigint | not null default 1 | 容量、偏好、项目优先级依赖版本 |
+| preference_revision | bigint | not null default 1 | 用户长期容量与稳定偏好版本，不包含项目优先级 |
 | updated_at | timestamptz | not null | 更新时间 |
 
-`preference_revision` 只在长期偏好或容量基线生效后递增。临时事件写入 UserWeekCapacity 或 UserFeedback，不直接修改基线。
+`preference_revision` 只在长期偏好或容量基线生效后递增。临时事件写入 UserWeekCapacity 或 UserFeedback，不直接修改基线；项目优先级属于 Project 聚合，由 `project_revision` 保护。
 
 ---
 
@@ -144,10 +144,11 @@ erDiagram
 | target_date | date | null | 截止日期 |
 | deadline_day_policy | varchar(20) | check | `event_exclusive / date_inclusive`；考试日不计准备容量，交付日可计 |
 | priority | smallint | check 1..100 | 用户确认的优先级 |
-| minimum_weekly_minutes | integer | check >= 0 | 最低维持量 |
+| minimum_weekly_minutes | integer | check >= 0 | active 项目的最低维持量；paused 项目不适用 |
 | confidence | varchar(10) | check | `low / medium / high` |
 | route_revision | bigint | not null default 1 | 路线版本 |
 | plan_revision | bigint | not null default 1 | 两周任务窗口版本 |
+| project_revision | bigint | not null default 1 | 目标、截止、优先级等项目元数据版本 |
 | task_event_revision | bigint | not null default 0 | 项目内任务事件提交有序水位 |
 | terminal_reason | varchar(30) | null | `user_completed / deadline_reached` |
 | ended_at | timestamptz | null | completed 或 closed 的时间 |
@@ -308,14 +309,16 @@ sum(active week plan minutes) <= allocatable_minutes
 | budget_minutes | integer | check >= 0 | 项目预算上限 |
 | minimum_minutes | integer | check >= 0 | 最低维持量快照 |
 | priority_snapshot | smallint | not null | 优先级快照 |
+| project_revision_snapshot | bigint | not null | 生成分配时使用的项目版本 |
 | deadline_risk | varchar(10) | check | `none / low / medium / high` |
-| status | varchar(20) | check | `reserved / active / released / settled` |
+| allocation_reason | varchar(30) | check | `scheduled / capacity_shortage` |
+| status | varchar(20) | check | `reserved / active / unfunded / released / settled` |
 | planned_minutes | integer | check >= 0 | 项目已计划汇总 |
 | actual_minutes | integer | check >= 0 | 实际投入汇总 |
 | created_at | timestamptz | not null | 创建时间 |
 | updated_at | timestamptz | not null | 更新时间 |
 
-唯一约束：`unique(allocation_set_id, project_id)`、`unique(id, user_id, project_id)`。复合外键 `(allocation_set_id, user_id, user_week_capacity_id) → user_week_allocation_sets`、`(user_week_capacity_id, user_id) → user_week_capacities`、`(project_id, user_id) → projects` 保证 set、capacity 和 project 均属于同一 user。`budget_minutes`、`minimum_minutes`、`priority_snapshot` 与 `deadline_risk` 在所属集合 active 后不可修改；生命周期状态与投入汇总仍可更新。
+唯一约束：`unique(allocation_set_id, project_id)`、`unique(id, user_id, project_id)`。复合外键 `(allocation_set_id, user_id, user_week_capacity_id) → user_week_allocation_sets`、`(user_week_capacity_id, user_id) → user_week_capacities`、`(project_id, user_id) → projects` 保证 set、capacity 和 project 均属于同一 user。`budget_minutes`、`minimum_minutes`、`priority_snapshot`、`project_revision_snapshot` 与 `deadline_risk` 在所属集合 active 后不可修改；生命周期状态与投入汇总仍可更新。`budget_minutes=0` 且 `allocation_reason=capacity_shortage` 的项目必须为 `unfunded`，不创建 WeekPlan、不投递 PlanningRun，项目本身仍保持 active。AllocationSet 被 supersede 时，尚未 settled 的 reserved/active/unfunded item 全部转为 released；新 AllocationSet 再按新容量创建 funded 或 unfunded item。
 
 ### 5.4 `user_week_runs`
 
@@ -362,7 +365,7 @@ sum(active week plan minutes) <= allocatable_minutes
 | budget_minutes | integer | check >= 0 | 预算快照 |
 | planned_minutes | integer | check >= 0 | 任务时长汇总 |
 | summary | text | not null default '' | 周目标摘要 |
-| creation_source | varchar(30) | check | `initial_planning / allocation_shell / weekly_review / temporary_replan / recovery` |
+| creation_source | varchar(30) | check | `initial_planning / allocation_shell / weekly_review / temporary_replan / recovery / calibration_hold` |
 | source_planning_run_id | uuid | FK planning_runs, null | 生成来源 |
 | promoted_at | timestamptz | null | 晋升为安全基线时间 |
 | settled_at | timestamptz | null | 结算时间 |
@@ -377,7 +380,7 @@ sum(active week plan minutes) <= allocatable_minutes
 
 `week_start` 必须是上海时区自然周的周一。普通 Task 只归属 WeekPlan，不指定执行日；可选 due_date 必须落在目标周内。Project.target_date 只有落在该 WeekPlan 周内时才向任务继承边界，更远截止保持 null，由领域服务校验。
 
-下一预备周预算分配提交时，确定性协调服务必须为每个在该预备周仍可执行的 active 项目创建或复用 `creation_source=allocation_shell` 的空 `prepared` WeekPlan，并绑定该次 allocation item。考试日期落在当前执行周的 event_exclusive 项目不获得下一周 allocation/壳计划。项目 PlanningSnapshot 只能在该事务提交后创建，因此需要继续规划的项目 `week.prepared` 始终可解析；WeeklyReview 只向该壳计划填充或调整 Task，不负责创建 WeekPlan。
+下一预备周预算分配提交时，确定性协调服务只为满足 `Project.status=active && budget_minutes>0 && 非 deadline-week && 非 calibration_hold` 的项目创建或复用 `creation_source=allocation_shell` 的空 `prepared` WeekPlan，并绑定该次 allocation item。unfunded、截止周、paused 或 needs_calibration 项目不获得下一周任务壳计划，也不投递 PlanningRun。项目 PlanningSnapshot 只能在该事务提交后创建，因此符合准入条件的项目 `week.prepared` 始终可解析；WeeklyReview 只向该壳计划填充或调整 Task，不负责创建 WeekPlan。首次规划的残周少于 4 天是唯一前瞻例外：在本周启动计划之外，可同时创建下一完整执行周与后一预备周的两个已绑定 allocation item 的计划；下周周一仍按普通晋升规则将前者变为 active。若连续无记录且没有 prepared，周一只创建 `creation_source=calibration_hold` 的空 active WeekPlan，不创建更远周计划。
 
 ### 6.2 `tasks`
 
@@ -393,6 +396,8 @@ sum(active week plan minutes) <= allocatable_minutes
 | description | text | not null default '' | 执行说明 |
 | task_kind | varchar(20) | check | `main / review / remediation / exploration / rest` |
 | estimated_minutes | integer | check > 0 | 预计时长 |
+| actual_minutes | integer | null, check >= 0 | 用户记录的累计实际时长当前投影；后续修改覆盖，不按事件重复累加 |
+| first_completed_at | timestamptz | null | 第一次完成时间；用于无实际时长时判断是否发生过真实完成 |
 | necessity | varchar(10) | check | `required / optional` |
 | due_date | date | null | 客观最晚完成日期，不代表指定执行日；通常由后端继承 |
 | order_key | integer | not null | 周任务推荐顺序，由模型数组顺序生成 |
@@ -413,7 +418,7 @@ sum(active week plan minutes) <= allocatable_minutes
 
 复合外键：`(week_plan_id, user_id, project_id) → week_plans`、`(source_milestone_id, user_id, project_id) → milestones`；`origin_task_id` 若非空也必须与当前任务属于同一 user/project。数据库不能只凭单列 ID 建立这些关系。
 
-Task 不保存 `is_blocking/is_blocked`，也不保存 difficulty。阻塞由 TaskDependency 动态计算；执行感受通过反馈记录。用户不能经公开 API 直接 INSERT Task，所有任务来自经过校验的系统/AI 规划命令。
+Task 不保存 `is_blocking/is_blocked`，也不保存 difficulty。阻塞由 TaskDependency 动态计算；执行感受通过反馈记录。actual_minutes 是累计总量投影，不是单次 session；完成事件携带时长与单独的 duration_recorded 使用同一幂等更新语义，不能重复计入。用户不能经公开 API 直接 INSERT Task，所有任务来自经过校验的系统/AI 规划命令。
 
 ### 6.3 `task_dependencies`
 
@@ -448,7 +453,7 @@ is_blocked(task) = exists incoming dependency whose prerequisite is not complete
 | event_type | varchar(20) | check | `completed / reopened / skipped / restored / deferred / cancelled / replaced / duration_recorded` |
 | previous_status | varchar(20) | not null | 旧状态 |
 | new_status | varchar(20) | not null | 新状态 |
-| actual_minutes | integer | null, check >= 0 | 实际时长 |
+| actual_minutes | integer | null, check >= 0 | 本次写入的累计实际时长；应用后覆盖 Task.actual_minutes |
 | reason_code | varchar(40) | null | 机器可读原因；截止终止使用 `project_deadline_reached` |
 | note | text | null | 用户备注 |
 | idempotency_key | varchar(200) | not null | 客户端写入幂等键 |
@@ -459,7 +464,7 @@ is_blocked(task) = exists incoming dependency whose prerequisite is not complete
 
 写事件时按统一锁顺序锁定 Project 后锁定 Task，将 `Project.task_event_revision + 1` 同时写回 Project 和新 TaskEvent。这样 revision 的可见顺序与事务提交顺序一致；`event_seq` 即使因并发或回滚出现跳号也不会漏事件。
 
-任务表保存当前状态，TaskEvent 保存不可变历史。撤销完成使用 `reopened`，恢复 skipped 使用 `restored`，都追加新事件而不删除历史。周结算决定延期时写 deferred 事件，旧任务进入终态，并在新周创建带 origin_task_id 的新任务；不跨周移动旧行。项目截止结算对每个 planned Task 写 cancelled 事件及 `reason_code=project_deadline_reached`，不能与用户主动取消混淆。
+任务表保存当前状态，TaskEvent 保存不可变历史。actual_minutes 采用“累计总量、后写覆盖”语义；重复提交由 idempotency_key 去重，修正只追加新事件，不重放历史事件求和。撤销完成使用 `reopened`，恢复 skipped 使用 `restored`，都追加新事件而不删除历史。周结算决定延期时写 deferred 事件，旧任务进入终态，并在新周创建只表示剩余工作的 origin_task_id 新任务；旧任务已记录的实际投入归属于旧周，不跨周移动旧行。项目截止结算对每个 planned Task 写 cancelled 事件及 `reason_code=project_deadline_reached`，不能与用户主动取消混淆。
 
 ### 6.5 `user_feedback`
 
@@ -472,8 +477,11 @@ is_blocked(task) = exists incoming dependency whose prerequisite is not complete
 | raw_text | text | not null | 原始反馈 |
 | candidate_scope | varchar(30) | null | 模型候选分类 |
 | confirmed_scope | varchar(30) | null | `one_time / stable_preference / goal_change` |
-| impact_scope | varchar(20) | null | `project / user`，决定是否先重分配用户周容量 |
+| impact_scope | varchar(20) | null | `task / project / user / goal`，决定路由范围 |
 | impact_nature | varchar(20) | null | `temporary / observe / structural / goal_change` |
+| urgency | varchar(20) | null | `immediate / weekly / trend` |
+| execution_blocked | boolean | null | 明确反馈是否阻塞当前执行 |
+| signal_kind | varchar(30) | null | `execution_fact / difficulty / availability / preference / goal_change / other` |
 | status | varchar(30) | check | `received / classified / pending_confirmation / applied / dismissed` |
 | structured_payload | jsonb | versioned | 解析后的候选信息 |
 | created_at | timestamptz | not null | 创建时间 |
@@ -485,7 +493,7 @@ is_blocked(task) = exists incoming dependency whose prerequisite is not complete
 
 ### 6.6 `project_week_assessments`
 
-每个项目每周最多一条结构化评估，作为最近 2—3 周趋势的确定性输入，不让模型每次从原始任务重新总结同一历史。
+每个项目每周最多一条结构化评估，作为最近 2—3 周趋势的确定性输入，不让模型每次从原始任务重新总结同一历史。`not_scheduled` 表示本周预算为 0，不是用户无记录，不进入 needs_calibration 趋势。
 
 | 字段 | 类型 | 约束 | 说明 |
 |---|---|---|---|
@@ -493,7 +501,7 @@ is_blocked(task) = exists incoming dependency whose prerequisite is not complete
 | user_id | uuid | not null | 用户 |
 | project_id | uuid | not null | 项目 |
 | week_start | date | not null | 被评估自然周 |
-| status | varchar(20) | check | `normal / ahead / behind / overloaded / blocked / needs_calibration / insufficient_data` |
+| status | varchar(20) | check | `normal / ahead / behind / overloaded / blocked / needs_calibration / not_scheduled / insufficient_data` |
 | impact_nature | varchar(20) | check | `temporary / observe / structural / none` |
 | planned_minutes | integer | check >= 0 | 计划量快照 |
 | completed_minutes | integer | check >= 0 | 按已完成任务预计时长汇总 |
@@ -716,6 +724,8 @@ user_week_capacity（跨周时按 week_start 排序）
 5. 更新缓存汇总字段；
 6. 提交事务。
 
+项目暂停引起周中重分配时，旧 allocation item 和其计划只保留审计汇总；可重新分配的容量等于原可分配容量减去已发生的实际投入及其他不可撤销的已完成工作量。暂停项目的当前 active 与后续 reserved item 都转为 `released`，不会作为新集合的可用预算或重新绑定目标。
+
 定时一致性检查任务每天重新汇总并上报差异，但不自动覆盖数据。
 
 ### 10.4 截止前可行性
@@ -727,14 +737,18 @@ day_discount_capacity(cutoff) = floor(
   allocatable_minutes × count(available days from planning_start through cutoff)
   / count(available_weekdays in full week)
 )
-consumed_minutes = sum(coalesce(explicit actual_minutes, completed Task.estimated_minutes))
+effective_consumed(task) =
+  task.actual_minutes                         if actual_minutes is not null
+  else task.estimated_minutes                  if task.first_completed_at is not null
+  else 0
+consumed_minutes = sum(effective_consumed(task) for tasks in this week)
 capacity_before(cutoff) = min(
   day_discount_capacity(cutoff),
   allocatable_minutes - consumed_minutes
 )
 ```
 
-执行周 planning_start 为当前上海业务日期，预备周为 week_start；已过去日期不再计容量。考试类 `event_exclusive` 不计 target_date，当日考试任务的 effective_due_date 取前一日；交付类 `date_inclusive` 可计 target_date。对周内每个不同 cutoff，校验所有项目 `necessity=required AND effective_due_date <= cutoff` 的 planned Task estimated_minutes 累计值不超过 capacity_before(cutoff)。无 due_date 的普通任务只参与周总量校验。多个项目共享同一累计容量，不得分别重复使用。
+执行周 planning_start 为当前上海业务日期，预备周为 week_start；已过去日期不再计容量。考试类 `event_exclusive` 不计 target_date，当日考试任务的 effective_due_date 取前一日；交付类 `date_inclusive` 可计 target_date。对周内每个不同 cutoff，校验所有项目 `necessity=required AND effective_due_date <= cutoff` 的 planned Task estimated_minutes 累计值不超过 capacity_before(cutoff)。无 due_date 的普通任务只参与周总量校验。多个项目共享同一累计容量，不得分别重复使用。部分投入后 deferred 的旧任务实际时长只计入旧周，新任务只校验剩余预计分钟。
 
 available_weekdays_count=0 时截止前容量和周可执行容量均视为 0，不执行除法；只有显式 rest/说明性条目可以存在。
 
@@ -745,6 +759,7 @@ available_weekdays_count=0 时截止前容量和周可执行容量均视为 0，
 - advanced/closed milestone 使用数据库触发器保护路线定义字段；
 - settled WeekPlan 不允许新增或移动任务；
 - completed Task 可以通过 `reopened` 事件显式撤销，但不能静默覆盖；
+- Task.actual_minutes 只能由带幂等键的完成或 duration_recorded 事件覆盖，不能通过普通 Task PATCH 直接修改；
 - Snapshot、TaskEvent、ModelInvocation 和 ProposalDecision 只追加，不更新业务内容。
 
 ### 10.6 租户复合外键
