@@ -46,6 +46,8 @@ stateDiagram-v2
 
 暂停事务锁定 Project 及其当前规划窗口资源，并在同一用户周重分配事务中执行：Project `active → paused`；当前 active allocation 与后续 reserved allocation 均转为 `released`；当前 active WeekPlan 与全部后续 prepared WeekPlan 转为 `superseded`；所有仍为 planned 的任务写 cancelled 事件并记录 `reason_code=project_paused`；取消未终结 PlanningRun、失效未应用 Proposal。已完成任务、实际投入和 completed/skipped/deferred 等历史不变。系统随后仅从未锁定的剩余容量创建新 AllocationSet 供其他 active 项目竞争，暂停项目不获得新 item 或 WeekPlan。恢复事务执行 `paused → active`，创建新的 AllocationSet 并按当前目标重新生成两周窗口；长时间暂停或上下文已变化时触发结构性检查，但不恢复旧 Task 行。
 
+用户完成事务仅由显式 API 触发：按完整锁顺序锁定相关容量、分配与 Project，校验 expected_project_revision，Project `active → completed`、terminal_reason=`user_completed`、ended_at=now；未 advanced 路线转 closed(project_completed)，planned Task 转 cancelled(project_completed)，当前 active 与未来 prepared WeekPlan 全部转 superseded，释放其未 settled allocation并使未生效规划失效；settled WeekPlan 保留历史状态。系统不得根据任务比例或模型判断自动进入 completed。
+
 项目最终截止结算使用一个领域事务：当上海业务日期超过 target_date，按统一锁顺序锁定 Project，确认 deadline_day_policy，将 planning/active/paused Project 转为 closed、terminal_reason=`deadline_reached`、ended_at=now；将所有未 advanced 的 Stage/Milestone 转为 closed；将所有仍为 planned 的 Task 转为 cancelled 并写 `reason_code=project_deadline_reached`；创建不可变 ProjectClosureSnapshot；递增 route_revision/plan_revision；取消项目内 pending/queued/running/retry_wait PlanningRun；使 draft/validated/pending_confirmation Proposal 失效；停止创建下一预备周。任一步失败则整批回滚。advanced 与任务历史终态保持原状。event_exclusive 与 date_inclusive 只影响 target_date 当天是否仍可执行，不改变到期后的关闭规则。
 
 到期前，每次任务终态变化、反馈、容量变化、周滚动或规划命令应用后都重新校验截止可行性；每日扫描兜底。infeasible 结果立即产生 deadline_risk 并触发 EventDrivenReplanning，不进入 2—3 周观察等待。截止结算优先于普通周滚动和路线校准；结算锁定后，旧 Worker 即使完成模型调用也不能提交结果。
@@ -286,7 +288,8 @@ stateDiagram-v2
 - queued 是可观测状态，不是 Worker 的强制前置条件；
 - Worker 可以原子地将 pending、queued 或到期 retry_wait 更新为 running；
 - Dispatcher 只在 PlanningRun 仍为 pending 时补写 queued，不能把 running/succeeded 降级回 queued；
-- 同一 idempotency_key 只允许一个非 cancelled PlanningRun；
+- 同一 idempotency_key 永久只允许一个 PlanningRun，包括 cancelled；
+- 业务条件变化后需要重建时，在同一 run_family_key 下递增 generation 并生成包含新 trigger/input revision 的新 idempotency_key；旧运行保持只读审计；
 - Worker 启动时重新验证 Project/UserWeekRun 是否仍可运行；
 - cancelled 消息即使被 Celery 重复投递，Worker 也应直接返回成功而不执行模型调用；
 - 项目截止结算可 CAS 取消仍未终结的运行并清空租约；旧 Worker 的终态 CAS 随后必须失败；
@@ -439,6 +442,9 @@ pending → sending → sent
 - 任一 TaskDependency 图都无环，is_blocked/is_blocking 只由依赖事实派生；
 - deferred 旧任务不跨周移动，目标周一定创建可追溯的新任务或整批回滚；
 - 每个截止点之前的 required 任务累计量不超过按有效天数折算的容量；
+- 未完成任务的 `effective_consumed + remaining_estimated` 不重复计算：无 actual 时等于 estimated，有部分 actual 且未超预计时仍等于 estimated，actual 超预计时等于 actual；完成后 remaining 为 0；
+- settled/superseded 历史周补记 TaskEvent 时锁定 WeekPlan 原绑定的 AllocationSet/Allocation，不依赖当前 active AllocationSet；
+- Project 进入 completed 后不存在 active/prepared WeekPlan，相关未 settled allocation 已释放，settled 历史计划保持不变；
 - 任意设置 target_date 的 planning/active/paused 项目在业务日期超过该日期后 closed 而非 completed，且存在唯一不可变 ProjectClosureSnapshot；
 - 截止关闭后不存在 planned Task、可提交的项目 PlanningRun 或未失效 Proposal；到期取消事件使用 project_deadline_reached；
 - 连续 2—3 周趋势只触发检查/强信号，未确认 structural 时不修改剩余路线。

@@ -74,11 +74,16 @@
 | POST | `/auth/wechat/login` | 微信 code 登录或注册 |
 | POST | `/auth/refresh` | 刷新并轮换 token |
 | POST | `/auth/logout` | 撤销当前 refresh token |
+| GET | `/auth/sessions` | 查询当前用户的有效设备会话 |
+| DELETE | `/auth/sessions/{session_id}` | 按设备撤销指定会话及其 refresh token |
+| POST | `/auth/logout-all` | 撤销全部会话并提升用户 token version |
 | GET | `/me` | 当前用户与偏好 |
 | PATCH | `/me/preferences` | 修改容量与稳定偏好，需 preference_revision |
 | DELETE | `/me` | 发起账号删除流程 |
 
 `PATCH /me/preferences` 中长期容量变化必须明确展示影响，并递增 preference_revision。
+
+`POST /auth/refresh` 在同一事务中锁定 `AuthSession` 与当前 `RefreshToken`，将旧 token 标记为 `rotated`，创建只保存哈希的新 token，并建立轮换链。已使用 token 再次出现属于重放，必须撤销整个会话及其未过期 token。访问令牌同时携带并校验 `user_id`、`session_id`、`users.auth_version` 与 `auth_sessions.session_version`；按设备撤销只影响目标会话，全量退出提升 `users.auth_version`。
 
 ### 2.2 Projects 与 Route
 
@@ -93,6 +98,7 @@
 | GET | `/projects/{project_id}/route` | 当前阶段、里程碑和未来路线 |
 | POST | `/projects/{project_id}/pause` | 用户确认暂停 |
 | POST | `/projects/{project_id}/resume` | 恢复项目 |
+| POST | `/projects/{project_id}/complete` | 用户确认目标实际达成并结束项目 |
 | POST | `/projects/{project_id}/archive` | 归档项目 |
 
 目标、截止和优先级变化不通过普通 PATCH 静默修改，应先创建 UserFeedback/Proposal 或专用确认操作。
@@ -133,7 +139,18 @@
 
 `POST /projects/{project_id}/pause` 在同一用户周重分配事务中完成：保留已完成任务和实际投入；取消当前与后续窗口中仍为 planned 的任务；将当前 active WeekPlan 和全部后续 prepared WeekPlan 置为 superseded；将当前 active allocation 与后续 reserved allocation 置为 released；取消项目规划运行并使未应用 Proposal 失效；随后仅以未锁定的剩余容量创建新的 AllocationSet 供其他 active 项目分配。paused 项目不占容量、不生成任务。`POST /projects/{project_id}/resume` 创建新的 AllocationSet 版本，项目只有重新获得大于 0 的预算后才创建 prepared 计划并投递 WeeklyReview。
 
-GoalChange 使用独立的 `/goal-changes/{candidate_id}/confirm`，不复用 `/feedback/{feedback_id}/confirm` 直接应用。请求必须通过 `Idempotency-Key` 请求头提供幂等键；请求体只包含后端生成的候选 ID、确认结果和版本：
+`POST /projects/{project_id}/complete` 要求 `Idempotency-Key` 请求头，请求体为：
+
+```json
+{
+  "expected_project_revision": 6,
+  "completion_note": "已完成最终交付"
+}
+```
+
+仅 active Project 可执行。事务重新校验 revision 后写 `status=completed`、`terminal_reason=user_completed`、`ended_at`，关闭未 advanced 路线、以 `reason_code=project_completed` 取消仍为 planned 的任务，将当前 active 和未来 prepared WeekPlan 全部置为 `superseded`，释放其未 settled allocation，取消未终结 PlanningRun 并失效未应用 Proposal。已 settled WeekPlan 保持只读历史。AI 和普通反馈分类不得自动调用本接口；到期但未确认达成仍走 DeadlineClosure → closed。
+
+GoalChange 使用独立的 `/goal-changes/{candidate_id}/confirm`，不复用 `/feedback/{feedback_id}/confirm` 直接应用；但不建立独立持久化表。`candidate_id` 就是 `proposal_kind=system_goal_change/system_preference_change` 的 PlanningProposal.id，查询、过期、拒绝、失效和决策审计复用 Proposal/ProposalDecision。请求必须通过 `Idempotency-Key` 请求头提供幂等键；请求体只包含后端生成的候选 ID、确认结果和版本：
 
 ```json
 {
@@ -267,6 +284,8 @@ GoalChange 使用独立的 `/goal-changes/{candidate_id}/confirm`，不复用 `/
 | GET | `/notification-settings` | 通知设置 |
 | PATCH | `/notification-settings` | 更新订阅偏好 |
 | POST | `/wechat/subscription-consents` | 保存微信订阅授权结果 |
+
+`GET/PATCH /notification-settings` 映射 `NotificationPreference`，更新使用 revision/条件写防止并发覆盖。`POST /wechat/subscription-consents` 写入 `WeChatSubscriptionConsent`；一次性授权在创建发送记录时原子地从 `granted` 变为 `consumed`。`NotificationDelivery` 记录使用的偏好版本和授权记录，发送失败不把一次性授权恢复为可用。
 
 ---
 
@@ -424,19 +443,30 @@ apply_proposal(proposal_id, decision):
 
 ```text
 append_task_event(task_id, request):
+  refs = resolve user_id, week_start, allocation_id, project_id without row locks
   begin transaction
     lookup prior idempotent result
-    project = select Project for update
-    task = select task for update
+    capacity = select UserWeekCapacity(refs.user_id, refs.week_start) for update
+    allocation_set = select WeekPlan.referenced UserWeekAllocationSet for update
+    allocation = select WeekPlan.referenced UserWeekAllocation for update
+    project = select referenced Project for update
+    week_plan = select referenced WeekPlan for update
+    task = select Task(task_id) for update
+    verify locked ownership chain still matches refs
     verify expected_task_version
     verify transition
+    before_consumed = effective_consumed(task)
     next_revision = project.task_event_revision + 1
     insert TaskEvent(project_event_revision = next_revision)
     update Project.task_event_revision = next_revision
     update Task status/version
-    update WeekPlan/UserWeek actual summaries if needed
+    after_consumed = effective_consumed(task)
+    update WeekPlan, Allocation and UserWeekCapacity summaries by after_consumed - before_consumed
+    revalidate user capacity and deadline feasibility when relevant
   commit
 ```
+
+TaskEvent 不允许先锁 Project/Task 后再更新容量汇总。`referenced` 指该 WeekPlan 原本绑定的 AllocationSet/Allocation，不是当前 active 集合；因此 settled 或 superseded 历史周仍可安全补记实际耗时。即使某类事件当前不改变 actual_minutes，也使用同一锁序，避免后续事件类型扩展重新引入死锁分支。
 
 ### 5.4 截止前可行性校验
 
@@ -444,12 +474,14 @@ append_task_event(task_id, request):
 validate_deadline_feasibility(user_id, week_start, proposed_tasks):
   capacity = load UserWeekCapacity and available_weekdays
   normal_days = count(effective available weekdays in full week)
-  planning_start = business_date if week_start is current week else week_start
-   effective_consumed(task) = task.actual_minutes if not null
-                              else task.estimated_minutes if task.first_completed_at is not null
-                              else 0
-   consumed = sum(effective_consumed(task) for tasks in this week)
-  unconsumed_capacity = max(0, allocatable_minutes - consumed)
+  earliest_cutoff = business_date if week_start is current week else week_start
+  reject proposed due_date earlier than earliest_cutoff
+  effective_consumed(task) = task.actual_minutes if not null
+                             else task.estimated_minutes if task.first_completed_at is not null
+                             else 0
+  remaining_estimated(task) = 0 if task is terminal
+                              else max(0, task.estimated_minutes - coalesce(task.actual_minutes, 0))
+  consumed_to_date = sum effective_consumed for all tasks already belonging to this UserWeek
   canonicalize each task:
     due_date = explicit allowed constraint
                or inherited project target_date boundary when target_date is in this week
@@ -461,12 +493,12 @@ validate_deadline_feasibility(user_id, week_start, proposed_tasks):
     if normal_days == 0:
       available = 0
     else:
-      day_discount = floor(
-        allocatable_minutes * count(effective available days from planning_start through cutoff)
+      cumulative_capacity = floor(
+        allocatable_minutes * count(effective available days from week_start through cutoff)
         / normal_days
       )
-      available = min(day_discount, unconsumed_capacity)
-    required = sum estimated_minutes across all projects
+      available = max(0, cumulative_capacity - consumed_to_date)
+    required = sum remaining_estimated(task) across all existing unfinished and proposed tasks in all projects
                where necessity=required and effective_due_date <= cutoff
     if required > available:
       raise DEADLINE_CAPACITY_EXCEEDED(cutoff, available, required, overflow)
@@ -475,7 +507,7 @@ validate_deadline_feasibility(user_id, week_start, proposed_tasks):
   verify each project total <= allocation budget
 ```
 
-该算法只按日计数做容量折算，不生成每日计划。Proposal 预检执行一次，应用事务在锁定 Capacity/Allocation/WeekPlan 后再次执行，避免并发项目分别重复使用同一截止前容量。
+该算法只按日计数做累计容量折算，不生成每日计划，也不持久化额外的 remaining 字段。未登记实际耗时时，未完成任务的待安排量就是完整 estimated_minutes；登记部分实际耗时后，待安排量派生为 `max(0, estimated_minutes - actual_minutes)`；任务完成后待安排量为 0。这样预计 100、已投入 40、尚未完成的任务合计仍占 100，而不是 140。若实际投入已超过预计，则 consumed_to_date 保留真实投入、待安排量归零。当前周拒绝早于业务日期的截止点，因此所有有效截止点统一扣除校验时本周已记录的 `consumed_to_date`；预备周该值为 0。每个任务完整归属一个 effective_due_date；跨截止点工作先拆分任务。Proposal 预检执行一次，应用事务在锁定 Capacity/Allocation/WeekPlan 后再次执行，避免并发项目分别重复使用同一截止前容量。
 
 ---
 

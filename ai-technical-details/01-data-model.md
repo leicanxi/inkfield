@@ -13,7 +13,7 @@
 
 - 主键：应用生成 UUIDv7，便于分布式创建和大致按时间排序；
 - 事件存储序号：`task_events.event_seq` 使用数据库生成的 bigint，只用于主键、分页和近似时间排序，不作为一致性水位；
-- 任务事件修订号：每个项目使用 `projects.task_event_revision` 作为提交有序的一致性水位；写 TaskEvent 时先锁定 Project、事务内递增并写入事件；
+- 任务事件修订号：每个项目使用 `projects.task_event_revision` 作为提交有序的一致性水位；写 TaskEvent 时按完整容量锁序加锁，并在锁定 Project 后于事务内递增 `task_event_revision`、写入事件；
 - 时间戳：使用 `timestamptz` 并按 UTC 存储；
 - 业务日期：使用 `date`，自然周固定按 `Asia/Shanghai` 计算；
 - 时长：统一使用整数分钟；
@@ -38,6 +38,11 @@
 erDiagram
     USERS ||--o{ USER_IDENTITIES : binds
     USERS ||--|| USER_PREFERENCES : owns
+    USERS ||--o{ USER_DEVICES : uses
+    USERS ||--o{ AUTH_SESSIONS : authenticates
+    USER_IDENTITIES ||--o{ AUTH_SESSIONS : starts
+    USER_DEVICES ||--o{ AUTH_SESSIONS : hosts
+    AUTH_SESSIONS ||--o{ REFRESH_TOKENS : rotates
     USERS ||--o{ PROJECTS : owns
     USERS ||--o{ USER_WEEK_CAPACITIES : has
 
@@ -75,6 +80,8 @@ erDiagram
     PLANNING_PROPOSALS ||--o{ PROPOSAL_DECISIONS : decides
 
     PLANNING_RUNS ||--o{ OUTBOX_MESSAGES : dispatches
+    USERS ||--o{ NOTIFICATION_PREFERENCES : configures
+    USERS ||--o{ WECHAT_SUBSCRIPTION_CONSENTS : grants
     USERS ||--o{ NOTIFICATION_DELIVERIES : receives
 ```
 
@@ -90,6 +97,7 @@ erDiagram
 | status | varchar(20) | not null, check | `active / suspended / deleting / deleted` |
 | display_name | varchar(100) | not null default '' | 展示名称 |
 | locale | varchar(20) | not null default `zh-CN` | 当前完整方案固定中文 |
+| auth_version | bigint | not null default 1 | 用户级全端 token 失效版本 |
 | created_at | timestamptz | not null | 创建时间 |
 | updated_at | timestamptz | not null | 更新时间 |
 | deleted_at | timestamptz | null | 删除完成时间 |
@@ -110,7 +118,58 @@ erDiagram
 
 唯一约束：`unique(provider, provider_subject)`。
 
-### 3.3 `user_preferences`
+### 3.3 `user_devices`
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | uuid | PK | 设备 ID |
+| user_id | uuid | FK users | 用户 |
+| platform | varchar(20) | check | `wechat_mini / web / ios / android` |
+| device_label | varchar(100) | null | 用户可识别名称 |
+| fingerprint_hash | char(64) | null | 最小化设备指纹哈希，不保存原始指纹 |
+| status | varchar(20) | check | `active / revoked` |
+| last_seen_at | timestamptz | null | 最近活动 |
+| created_at | timestamptz | not null | 创建时间 |
+| revoked_at | timestamptz | null | 撤销时间 |
+
+唯一约束：同一用户下非空 fingerprint_hash 唯一。按设备撤销时锁定 UserDevice，将其 active AuthSession 全部 revoked。
+
+### 3.4 `auth_sessions`
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | uuid | PK | 会话族 ID |
+| user_id | uuid | FK users | 用户 |
+| identity_id | uuid | FK user_identities | 登录身份 |
+| device_id | uuid | FK user_devices | 所属设备 |
+| auth_version_snapshot | bigint | not null | 签发时 users.auth_version |
+| session_version | bigint | not null default 1 | 单设备会话失效版本 |
+| status | varchar(20) | check | `active / revoked / expired` |
+| issued_at, last_seen_at, expires_at | timestamptz | not null | 生命周期时间 |
+| revoked_at | timestamptz | null | 撤销时间 |
+| revoke_reason | varchar(30) | null | `logout / device_revoked / token_reuse / user_disabled / global_logout` |
+
+access token 至少携带 user_id、session_id、auth_version_snapshot、session_version 和过期时间。敏感操作同时校验 User.status、users.auth_version、AuthSession.status/session_version。
+
+### 3.5 `refresh_tokens`
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | uuid | PK | token 记录 ID |
+| user_id | uuid | FK users | 用户 |
+| session_id | uuid | FK auth_sessions | 会话族 |
+| token_hash | char(64) | unique | refresh token 哈希；绝不保存明文 |
+| parent_token_id | uuid | FK refresh_tokens, null | 轮换来源 |
+| replaced_by_token_id | uuid | FK refresh_tokens, null | 后继 token |
+| status | varchar(20) | check | `active / rotated / revoked / reused / expired` |
+| issued_at, expires_at | timestamptz | not null | 有效期 |
+| used_at, revoked_at | timestamptz | null | 使用或撤销时间 |
+
+refresh 时锁定 active token：校验哈希、会话和版本后将旧 token 置 rotated，并原子创建后继 token。再次使用 rotated token 视为重放，将其置 reused 并撤销整个 AuthSession。唯一约束：`unique(token_hash)`；同一 session 最多一个 active refresh token，使用部分唯一索引保证。
+
+### 3.6 `user_preferences`
+
+认证实体必须使用复合租户外键保持归属一致：`AuthSession(identity_id, user_id)`、`AuthSession(device_id, user_id)` 与 `RefreshToken(session_id, user_id)` 分别引用同一用户下的身份、设备和会话。全量退出或用户封禁提升 `users.auth_version`，使已有访问令牌无需逐条写入即可失效。
 
 | 字段 | 类型 | 约束 | 说明 |
 |---|---|---|---|
@@ -372,7 +431,7 @@ sum(active week plan minutes) <= allocatable_minutes
 | created_at | timestamptz | not null | 创建时间 |
 | updated_at | timestamptz | not null | 更新时间 |
 
-唯一约束：`unique(project_id, week_start, generation)`；部分唯一索引保证同一项目同一周最多一个 `prepared/active` 当前计划。Check：`planned_minutes <= budget_minutes`。
+唯一约束：`unique(project_id, week_start, generation)`；部分唯一索引保证同一项目同一周最多一个 `prepared/active` 当前计划。Check：`planned_minutes <= budget_minutes`。领域不变量：Project 为 `completed / closed / archived` 时不得存在 `prepared / active` WeekPlan；项目终结事务必须先将这些计划置为 `superseded`，settled 历史计划不变。
 
 租户与预算归属通过复合外键强制：`(project_id, user_id) → projects`，`(allocation_id, user_id, project_id) → user_week_allocations`；同时建立 `unique(id, user_id, project_id)` 供 Task 引用。
 
@@ -462,7 +521,7 @@ is_blocked(task) = exists incoming dependency whose prerequisite is not complete
 
 唯一约束：`unique(user_id, idempotency_key)`、`unique(project_id, project_event_revision)`。索引：`(project_id, project_event_revision)`、`(task_id, event_seq)`。复合外键 `(task_id, user_id, project_id) → tasks` 强制事件与任务租户一致。
 
-写事件时按统一锁顺序锁定 Project 后锁定 Task，将 `Project.task_event_revision + 1` 同时写回 Project 和新 TaskEvent。这样 revision 的可见顺序与事务提交顺序一致；`event_seq` 即使因并发或回滚出现跳号也不会漏事件。
+写事件前可用无锁查询解析 task 对应的 user/week/allocation/project ID，但进入写事务后必须按 `UserWeekCapacity → WeekPlan 明确引用的 AllocationSet → WeekPlan 明确引用的 Allocation → Project → WeekPlan → Task` 的完整顺序加锁。这里不要求 AllocationSet 仍为 active；历史周补记必须锁定 settled/superseded WeekPlan 原本绑定的集合与条目，不得改锁当前 active 集合。随后将 `Project.task_event_revision + 1` 同时写回 Project 和新 TaskEvent，并按变更前后 `effective_consumed` 差额同步更新相应历史周汇总。这样既保持 revision 的提交顺序，也避免与 Proposal、暂停和周滚动形成反向锁序；`event_seq` 即使因并发或回滚出现跳号也不会漏事件。
 
 任务表保存当前状态，TaskEvent 保存不可变历史。actual_minutes 采用“累计总量、后写覆盖”语义；重复提交由 idempotency_key 去重，修正只追加新事件，不重放历史事件求和。撤销完成使用 `reopened`，恢复 skipped 使用 `restored`，都追加新事件而不删除历史。周结算决定延期时写 deferred 事件，旧任务进入终态，并在新周创建只表示剩余工作的 origin_task_id 新任务；旧任务已记录的实际投入归属于旧周，不跨周移动旧行。项目截止结算对每个 planned Task 写 cancelled 事件及 `reason_code=project_deadline_reached`，不能与用户主动取消混淆。
 
@@ -556,7 +615,9 @@ is_blocked(task) = exists incoming dependency whose prerequisite is not complete
 | user_week_run_id | uuid FK null | 周协调父运行 |
 | workflow_type | varchar(40) | 工作流类型 |
 | status | varchar(30) | 见状态机文档 |
-| idempotency_key | varchar(200) unique | 业务运行幂等键 |
+| run_family_key | varchar(200) | 同一业务触发族，例如用户周/项目/工作流 |
+| generation | integer | 同一 run family 内从 1 递增的重建代次 |
+| idempotency_key | varchar(200) unique | 包含 run_family_key、generation 和触发 revision 的永久业务幂等键 |
 | input_versions | jsonb | 依赖版本向量 |
 | attempt_count | integer | 业务执行次数 |
 | priority | smallint | 队列优先级 |
@@ -567,6 +628,8 @@ is_blocked(task) = exists incoming dependency whose prerequisite is not complete
 | queued_at, started_at, finished_at | timestamptz | 生命周期时间 |
 | error_code, error_message | text | 标准化错误 |
 | created_at, updated_at | timestamptz | 审计时间 |
+
+唯一约束：`unique(idempotency_key)`、`unique(run_family_key, generation)`。相同 idempotency_key 无论原运行是 succeeded、failed、dead 或 cancelled 都返回原记录，不创建新行。业务状态变化后确需重建时，在锁定 run family 后使用 `generation + 1`，并把最新 trigger/input revision 纳入新 idempotency_key；禁止删除 cancelled 行后复用旧键。
 
 ### 8.2 `planning_snapshots`
 
@@ -597,11 +660,16 @@ Set 的 status 是派生汇总，例如 `processing / pending_confirmation / com
 
 - `id, proposal_set_id, batch_no, status`；
 - `batch_kind`：`auto / confirm / discuss`；
+- `proposal_kind`：`model_change / system_goal_change / system_preference_change`；
+- `source_feedback_id`：系统候选的反馈来源，可空；
+- `preview` JSONB：修改前后、影响周、容量变化、截止可行性和用户可读摘要；
 - `input_versions` JSONB；
 - `required_permission`：该批次后端计算的权限；
 - `created_at, expires_at, applied_at`。
 
 唯一约束：`unique(proposal_set_id, batch_no)`。每个 Proposal 都是原子批次；不得把自动命令和待确认命令放在同一 Proposal 中。自动批次应用后，待确认批次使用新的版本向量持久化。
+
+GoalChangeCandidate 不另建平行表：`candidate_id = planning_proposals.id`，且 proposal_kind 必须为 `system_goal_change` 或 `system_preference_change`、batch_kind 必须为 confirm。候选生命周期直接使用 Proposal 的 `pending_confirmation / applied / rejected / expired / invalidated`；expected revisions 保存于 input_versions，变更内容保存于唯一的 ApplyProjectGoalChange/ApplyPreferenceChange DomainCommand，拒绝与接受写 ProposalDecision。独立 GoalChange API 只是该 Proposal 子集的类型化查询与确认视图。
 
 ### 8.6 `domain_commands`
 
@@ -672,9 +740,49 @@ Set 的 status 是派生汇总，例如 `processing / pending_confirmation / com
 
 ## 九、通知
 
-`notification_deliveries` 核心字段：`id, user_id, channel, template_key, payload, status, idempotency_key, attempt_count, next_retry_at, provider_message_id, sent_at, last_error, created_at`。
+### 9.1 `notification_preferences`
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | uuid | PK | 设置 ID |
+| user_id | uuid | FK users | 用户 |
+| channel | varchar(20) | check | `in_app / wechat` |
+| notification_type | varchar(40) | not null | `weekly_ready / deadline_risk / needs_calibration / planning_failed` 等 |
+| enabled | boolean | not null | 是否启用 |
+| quiet_start, quiet_end | time | null | 可选免打扰窗口 |
+| revision | bigint | not null default 1 | 乐观锁版本 |
+| created_at, updated_at | timestamptz | not null | 审计时间 |
+
+唯一约束：`unique(user_id, channel, notification_type)`。
+
+### 9.2 `wechat_subscription_consents`
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | uuid | PK | 授权记录 ID |
+| user_id | uuid | FK users | 用户 |
+| identity_id | uuid | FK user_identities | 微信身份 |
+| template_key | varchar(80) | not null | 内部模板键 |
+| provider_template_id | varchar(200) | not null | 微信模板 ID |
+| status | varchar(20) | check | `granted / rejected / consumed / expired / revoked` |
+| provider_receipt | jsonb | redacted | 最小化保存的授权回执 |
+| granted_at, expires_at, consumed_at, revoked_at | timestamptz | null | 生命周期时间 |
+| created_at | timestamptz | not null | 创建时间 |
+
+每次发送前同时校验 NotificationPreference 与仍有效的 consent；需要一次性授权的模板在发送事务中将 consent 原子置 consumed。拒绝和撤销也保留审计状态，不能伪装成未询问。
+
+### 9.3 `notification_deliveries`
+
+核心字段：`id, user_id, preference_id, preference_revision, consent_id(null), channel, template_key, payload, status, idempotency_key, attempt_count, next_retry_at, provider_message_id, sent_at, last_error, created_at`。
 
 唯一约束：`unique(idempotency_key)`。通知与规划使用独立队列，失败不影响周滚动。
+
+### 9.4 保留策略
+
+- refresh token 明文从不落库；过期、轮换和撤销后的哈希至少保留到“token 最长有效期 + 最大重放检测窗口”结束；
+- AuthSession 和 UserDevice 的撤销记录保留到安全审计窗口结束，账号删除流程按删除策略匿名化或清除；
+- 微信授权记录保留到授权 consumed/expired/revoked 后的审计窗口，provider_receipt 只保留排障所需最小字段；
+- NotificationDelivery payload 按模板定义脱敏和过期清理，不把长期业务状态只保存在通知表。
 
 ---
 
@@ -711,7 +819,7 @@ user_week_capacity（跨周时按 week_start 排序）
 
 项目 Worker 不能先锁 Project 再回头锁 UserWeekCapacity。
 
-不涉及容量的 TaskEvent 事务使用 `project → task`；先锁 Project 并分配 `project_event_revision`，再锁 Task。任何同时涉及容量与任务的事务仍遵守完整顺序，不能从 Task 回头锁 Project。
+所有 TaskEvent 都可能改变完成汇总、实际投入或截止可行性，因此统一使用完整锁顺序，不再保留 `project → task` 的短事务分支。事务开始前的 ID 解析不得持有行锁；加锁后必须重新验证 Task 仍属于已锁定的 WeekPlan/Allocation/Project。任何事务都不能先锁 Project/Task 再回头锁 UserWeekCapacity。
 
 ### 10.3 容量一致性
 
@@ -733,22 +841,22 @@ user_week_capacity（跨周时按 week_start 排序）
 规划仍以周为单位，不建立每日任务表。后端使用 available_weekdays 和周可分配容量等额折算：
 
 ```text
-day_discount_capacity(cutoff) = floor(
-  allocatable_minutes × count(available days from planning_start through cutoff)
+cumulative_capacity(cutoff) = floor(
+  allocatable_minutes × count(available days from week_start through cutoff)
   / count(available_weekdays in full week)
 )
 effective_consumed(task) =
   task.actual_minutes                         if actual_minutes is not null
   else task.estimated_minutes                  if task.first_completed_at is not null
   else 0
-consumed_minutes = sum(effective_consumed(task) for tasks in this week)
-capacity_before(cutoff) = min(
-  day_discount_capacity(cutoff),
-  allocatable_minutes - consumed_minutes
-)
+remaining_estimated(task) =
+  0                                           if task is terminal
+  else max(0, task.estimated_minutes - coalesce(task.actual_minutes, 0))
+consumed_to_date = sum(effective_consumed(task) already recorded in this UserWeek)
+capacity_before(cutoff) = max(0, cumulative_capacity(cutoff) - consumed_to_date)
 ```
 
-执行周 planning_start 为当前上海业务日期，预备周为 week_start；已过去日期不再计容量。考试类 `event_exclusive` 不计 target_date，当日考试任务的 effective_due_date 取前一日；交付类 `date_inclusive` 可计 target_date。对周内每个不同 cutoff，校验所有项目 `necessity=required AND effective_due_date <= cutoff` 的 planned Task estimated_minutes 累计值不超过 capacity_before(cutoff)。无 due_date 的普通任务只参与周总量校验。多个项目共享同一累计容量，不得分别重复使用。部分投入后 deferred 的旧任务实际时长只计入旧周，新任务只校验剩余预计分钟。
+执行周只接受当前上海业务日期及之后的 cutoff，预备周从 week_start 开始；过去 due_date 拒绝。考试类 `event_exclusive` 不计 target_date，当日考试任务的 effective_due_date 取前一日；交付类 `date_inclusive` 可计 target_date。对周内每个不同 cutoff，校验所有项目现有未完成与候选新增中 `necessity=required AND effective_due_date <= cutoff` 的 `remaining_estimated(task)` 累计值不超过 capacity_before(cutoff)。remaining 是派生值而非新字段：未登记实际耗时等于 estimated，部分登记后扣除 actual，完成后为 0。每个 Task 的全部剩余量归属唯一 effective_due_date；跨截止点工作必须拆 Task，不隐式分摊。无 due_date 的普通任务只参与周总量校验。多个项目共享同一累计容量，不得分别重复使用。部分投入后 deferred 的旧任务实际时长只计入旧周，新任务只校验剩余预计分钟。
 
 available_weekdays_count=0 时截止前容量和周可执行容量均视为 0，不执行除法；只有显式 rest/说明性条目可以存在。
 
