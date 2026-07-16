@@ -38,3 +38,7 @@ pytest
 身份接口统一位于 `/api/v1`：微信登录、refresh 轮换、当前会话退出、会话查询/撤销、全部退出、`/me` 和偏好 revision 更新。refresh token 只以 SHA-256 哈希保存；access token 的用户级和会话级版本会在敏感请求中重新校验。
 
 微信平台交换通过 `WeChatIdentityProvider` 注入。未配置真实 Provider 时接口返回可重试的 503，不允许使用测试身份进入生产。
+
+## 项目与路线
+
+`/api/v1/projects` 提供项目创建、列表、详情、允许字段更新、路线与关闭快照读取，以及 pause、resume、complete、archive 命令。目标、截止和优先级不通过普通 PATCH 静默修改。路线读取固定区分 current、冻结 history 与 tentative future；completed 只来自用户显式确认，deadline close 不会伪装为完成。

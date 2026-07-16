@@ -29,6 +29,21 @@ def test_identity_routes_are_exposed_under_api_v1() -> None:
     } <= paths.keys()
 
 
+def test_project_routes_match_the_existing_api_contract() -> None:
+    app = create_app(settings())
+    paths = app.openapi()["paths"]
+    assert {
+        "/api/v1/projects",
+        "/api/v1/projects/{project_id}",
+        "/api/v1/projects/{project_id}/route",
+        "/api/v1/projects/{project_id}/closure",
+        "/api/v1/projects/{project_id}/pause",
+        "/api/v1/projects/{project_id}/resume",
+        "/api/v1/projects/{project_id}/complete",
+        "/api/v1/projects/{project_id}/archive",
+    } <= paths.keys()
+
+
 def test_unconfigured_wechat_provider_fails_safely() -> None:
     with TestClient(create_app(settings())) as client:
         response = client.post(
