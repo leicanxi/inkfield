@@ -8,6 +8,10 @@
 2. [领域状态机](./02-state-machines.md)
 3. [AI 工作流与领域命令](./03-ai-workflows-and-commands.md)
 4. [API、异步协议与实施蓝图](./04-api-async-implementation.md)
+5. [后端与 AI 实施任务清单](./05-backend-ai-tasks.md)
+6. [后端与 AI 实施检查清单](./06-backend-ai-checklist.md)
+
+前四份文档定义实现契约；第五、六份文档将契约转换为可执行任务和一一对应的验收证据。当前任务/检查范围不包含客户端、材料模块和通知模块。
 
 ## 共同约定
 
