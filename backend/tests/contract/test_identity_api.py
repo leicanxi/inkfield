@@ -44,6 +44,21 @@ def test_project_routes_match_the_existing_api_contract() -> None:
     } <= paths.keys()
 
 
+def test_execution_routes_match_the_existing_api_contract() -> None:
+    app = create_app(settings())
+    paths = app.openapi()["paths"]
+    assert {
+        "/api/v1/user-weeks/current",
+        "/api/v1/user-weeks/{week_start}",
+        "/api/v1/projects/{project_id}/weeks/current",
+        "/api/v1/projects/{project_id}/weeks/{week_start}",
+        "/api/v1/tasks/current-week",
+        "/api/v1/tasks",
+        "/api/v1/tasks/{task_id}",
+        "/api/v1/tasks/{task_id}/events",
+    } <= paths.keys()
+
+
 def test_unconfigured_wechat_provider_fails_safely() -> None:
     with TestClient(create_app(settings())) as client:
         response = client.post(

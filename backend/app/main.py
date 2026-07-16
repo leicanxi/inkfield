@@ -15,6 +15,7 @@ from app.infrastructure.database.session import create_database_engine
 from app.infrastructure.redis import create_redis_client
 from app.modules.identity.api.routes import router as identity_router
 from app.modules.identity.infrastructure.providers import UnconfiguredWeChatProvider
+from app.modules.planning.api.execution_routes import router as execution_router
 from app.modules.planning.api.routes import router as planning_router
 
 
@@ -48,4 +49,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(identity_router)
     app.include_router(planning_router)
+    app.include_router(execution_router)
     return app
