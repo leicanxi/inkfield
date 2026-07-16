@@ -97,6 +97,40 @@
 
 目标、截止和优先级变化不通过普通 PATCH 静默修改，应先创建 UserFeedback/Proposal 或专用确认操作。
 
+`GET /projects/{project_id}/route` 是路线数据的唯一读取接口。除当前路线外，它还返回冻结的历史里程碑和暂定未来里程碑；不返回未来具体任务，也不把里程碑状态解释为能力认证：
+
+```json
+{
+  "project_id": "p_123",
+  "route_revision": 9,
+  "current": {
+    "stage": {"id": "stage_2", "title": "强化应用"},
+    "milestone": {"id": "milestone_4", "title": "综合练习", "status": "active"}
+  },
+  "history_milestones": [
+    {
+      "id": "milestone_3",
+      "title": "基础概念",
+      "stage_title": "基础建立",
+      "status": "advanced",
+      "transitioned_at": "2026-07-14T09:00:00+08:00"
+    }
+  ],
+  "future_milestones": [
+    {
+      "id": "milestone_5",
+      "title": "综合输出",
+      "stage_title": "实践输出",
+      "status": "planned",
+      "target_week_start": "2026-08-10",
+      "tentative": true
+    }
+  ]
+}
+```
+
+`history_milestones` 只包含 `advanced / superseded / closed` 的冻结对象，按路线顺序返回。`future_milestones` 只包含尚未开始的 `planned / paused` 对象，按阶段和里程碑顺序返回，所有项固定 `tentative=true`。当前 Milestone 不得同时出现在两个列表；项目归档、关闭或完成后保留历史和路线快照的只读查询，但不返回可执行任务。接口只定义字段、顺序和状态语义，不规定客户端展示方式。
+
 `POST /projects/{project_id}/pause` 在同一用户周重分配事务中完成：保留已完成任务和实际投入；取消当前与后续窗口中仍为 planned 的任务；将当前 active WeekPlan 和全部后续 prepared WeekPlan 置为 superseded；将当前 active allocation 与后续 reserved allocation 置为 released；取消项目规划运行并使未应用 Proposal 失效；随后仅以未锁定的剩余容量创建新的 AllocationSet 供其他 active 项目分配。paused 项目不占容量、不生成任务。`POST /projects/{project_id}/resume` 创建新的 AllocationSet 版本，项目只有重新获得大于 0 的预算后才创建 prepared 计划并投递 WeeklyReview。
 
 GoalChange 使用独立的 `/goal-changes/{candidate_id}/confirm`，不复用 `/feedback/{feedback_id}/confirm` 直接应用。请求必须通过 `Idempotency-Key` 请求头提供幂等键；请求体只包含后端生成的候选 ID、确认结果和版本：
