@@ -32,3 +32,9 @@ pytest
 ```
 
 集成测试使用真实 PostgreSQL/Redis，单元测试不得隐式连接外部服务。生产环境必须从密钥管理系统注入 `TOKEN_SIGNING_KEY`，不得使用 `.env.example` 的占位值。
+
+## 已开放的身份接口
+
+身份接口统一位于 `/api/v1`：微信登录、refresh 轮换、当前会话退出、会话查询/撤销、全部退出、`/me` 和偏好 revision 更新。refresh token 只以 SHA-256 哈希保存；access token 的用户级和会话级版本会在敏感请求中重新校验。
+
+微信平台交换通过 `WeChatIdentityProvider` 注入。未配置真实 Provider 时接口返回可重试的 503，不允许使用测试身份进入生产。

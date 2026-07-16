@@ -20,11 +20,21 @@ class Settings(BaseSettings):
     database_url: str
     redis_url: str
     token_signing_key: SecretStr
+    token_issuer: str = "yantian-backend"  # noqa: S105 - issuer, not a credential
+    access_token_ttl_seconds: int = 900
+    refresh_token_ttl_seconds: int = 2_592_000
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     policy_config_version: str = "policy-v1"
     prompt_config_version: str = "prompt-v1"
     correlation_header: str = "X-Correlation-ID"
     service_name: str = "yantian-backend"
+
+    @field_validator("access_token_ttl_seconds", "refresh_token_ttl_seconds")
+    @classmethod
+    def validate_positive_ttl(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("token TTL values must be positive")
+        return value
 
     @field_validator("token_signing_key")
     @classmethod
